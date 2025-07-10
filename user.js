@@ -1,164 +1,143 @@
-const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
+const mongoose = require('mongoose')
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+const { Schema } = mongoose
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
-
-const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS, 10) || 10;
-
-function normalizeEmail(email) {
-  return email.trim().toLowerCase();
+const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS, 10) || 12
+const { JWT_SECRET, JWT_EXPIRES_IN = '7d' } = process.env
+if (!JWT_SECRET || JWT_SECRET === 'change_this_secret') {
+  throw new Error('Environment variable JWT_SECRET must be set to a secure value.')
 }
 
-function isValidEmail(email) {
-  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return re.test(email);
+class DuplicateEmailError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'DuplicateEmailError'
+    this.code = 'EMAIL_IN_USE'
+  }
 }
 
-async function createUser(userData) {
-  const { name, email, password } = userData;
-  if (!name || !email || !password) {
-    throw new Error('Name, email, and password are required');
+const LeagueAccountSchema = new Schema({
+  provider: { type: String, required: true, enum: ['espn', 'yahoo', 'sleeper', 'nfl'] },
+  leagueId: { type: String, required: true },
+  accessToken: { type: String, required: true },
+  refreshToken: { type: String },
+  tokenExpiresAt: { type: Date },
+  lastSyncAt: { type: Date, default: null },
+  active: { type: Boolean, default: true }
+}, { _id: false })
+
+const PreferencesSchema = new Schema({
+  theme: { type: String, enum: ['light', 'dark'], default: 'light' },
+  notifications: {
+    email: { type: Boolean, default: true },
+    push: { type: Boolean, default: true }
+  },
+  adFree: { type: Boolean, default: false }
+}, { _id: false })
+
+const UserSchema = new Schema({
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  name: { type: String, trim: true, default: '' },
+  passwordHash: { type: String, required: true },
+  roles: { type: [String], default: ['user'] },
+  preferences: { type: PreferencesSchema, default: () => ({}) },
+  leagueAccounts: { type: [LeagueAccountSchema], default: [] }
+}, { timestamps: true })
+
+UserSchema.methods.setPassword = async function(password) {
+  this.passwordHash = await bcrypt.hash(password, SALT_ROUNDS)
+}
+
+UserSchema.methods.validatePassword = function(password) {
+  return bcrypt.compare(password, this.passwordHash)
+}
+
+UserSchema.methods.generateAuthToken = function() {
+  const payload = { sub: this._id, roles: this.roles }
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
+}
+
+UserSchema.methods.linkLeagueAccount = async function(account) {
+  const { provider, leagueId } = account
+  const idx = this.leagueAccounts.findIndex(a => a.provider === provider && a.leagueId === leagueId)
+  const allowedFields = ['accessToken', 'refreshToken', 'tokenExpiresAt', 'lastSyncAt', 'active']
+  if (idx >= 0) {
+    const sub = this.leagueAccounts[idx]
+    allowedFields.forEach(key => {
+      if (account[key] !== undefined) {
+        sub[key] = account[key]
+      }
+    })
+  } else {
+    const newAccount = { provider, leagueId }
+    allowedFields.forEach(key => {
+      if (account[key] !== undefined) {
+        newAccount[key] = account[key]
+      }
+    })
+    this.leagueAccounts.push(newAccount)
   }
+  return this.save()
+}
 
-  const normalizedEmail = normalizeEmail(email);
-  if (!isValidEmail(normalizedEmail)) {
-    throw new Error('Invalid email format');
+UserSchema.methods.unlinkLeagueAccount = async function(provider, leagueId) {
+  this.leagueAccounts = this.leagueAccounts.filter(a => !(a.provider === provider && a.leagueId === leagueId))
+  return this.save()
+}
+
+UserSchema.methods.updatePreferences = function(updates) {
+  if (updates.theme && ['light', 'dark'].includes(updates.theme)) {
+    this.preferences.theme = updates.theme
   }
+  if (typeof updates.adFree === 'boolean') {
+    this.preferences.adFree = updates.adFree
+  }
+  if (updates.notifications && typeof updates.notifications === 'object') {
+    if (typeof updates.notifications.email === 'boolean') {
+      this.preferences.notifications.email = updates.notifications.email
+    }
+    if (typeof updates.notifications.push === 'boolean') {
+      this.preferences.notifications.push = updates.notifications.push
+    }
+  }
+  return this.save()
+}
 
-  const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
-  const query = `
-    INSERT INTO users (name, email, password_hash)
-    VALUES ($1, $2, $3)
-    RETURNING id, name, email, created_at, updated_at
-  `;
-  const values = [name, normalizedEmail, passwordHash];
+UserSchema.statics.register = async function({ email, name, password }) {
+  const existing = await this.findOne({ email })
+  if (existing) {
+    throw new DuplicateEmailError('Email already in use')
+  }
+  const user = new this({ email, name })
+  await user.setPassword(password)
+  return user.save()
+}
 
+UserSchema.statics.authenticate = async function(email, password) {
+  const user = await this.findOne({ email })
+  if (!user) return null
+  const valid = await user.validatePassword(password)
+  return valid ? user : null
+}
+
+UserSchema.statics.findByToken = function(token) {
   try {
-    const result = await pool.query(query, values);
-    return result.rows[0];
-  } catch (err) {
-    if (err.code === '23505' && err.constraint && err.constraint.includes('users_email_key')) {
-      throw new Error('Email already in use.');
-    }
-    throw err;
+    const decoded = jwt.verify(token, JWT_SECRET)
+    return this.findById(decoded.sub)
+  } catch {
+    return null
   }
 }
 
-async function getUserById(userId) {
-  if (!userId) {
-    throw new Error('User ID is required');
-  }
-  const query = `
-    SELECT id, name, email, created_at, updated_at
-    FROM users
-    WHERE id = $1
-  `;
-  const result = await pool.query(query, [userId]);
-  return result.rows[0] || null;
+UserSchema.methods.toJSON = function() {
+  const obj = this.toObject({ virtuals: false })
+  delete obj.passwordHash
+  delete obj.__v
+  return obj
 }
 
-async function updateUser(userId, updateData) {
-  if (!userId) {
-    throw new Error('User ID is required');
-  }
-  const fields = [];
-  const values = [];
-  let idx = 1;
+const User = mongoose.model('User', UserSchema)
+User.DuplicateEmailError = DuplicateEmailError
 
-  if (updateData.name) {
-    fields.push(`name = $${idx++}`);
-    values.push(updateData.name);
-  }
-  if (updateData.email) {
-    const normalizedEmail = normalizeEmail(updateData.email);
-    if (!isValidEmail(normalizedEmail)) {
-      throw new Error('Invalid email format');
-    }
-    fields.push(`email = $${idx++}`);
-    values.push(normalizedEmail);
-  }
-  if (updateData.password) {
-    const hash = await bcrypt.hash(updateData.password, SALT_ROUNDS);
-    fields.push(`password_hash = $${idx++}`);
-    values.push(hash);
-  }
-  if (fields.length === 0) {
-    throw new Error('No fields provided for update');
-  }
-
-  values.push(userId);
-  const query = `
-    UPDATE users
-    SET ${fields.join(', ')}, updated_at = now()
-    WHERE id = $${idx}
-    RETURNING id, name, email, created_at, updated_at
-  `;
-
-  try {
-    const result = await pool.query(query, values);
-    if (result.rows.length === 0) {
-      throw new Error('User not found');
-    }
-    return result.rows[0];
-  } catch (err) {
-    if (err.code === '23505' && err.constraint && err.constraint.includes('users_email_key')) {
-      throw new Error('Email already in use.');
-    }
-    throw err;
-  }
-}
-
-async function deleteUser(userId) {
-  if (!userId) {
-    throw new Error('User ID is required');
-  }
-  const query = `
-    DELETE FROM users
-    WHERE id = $1
-    RETURNING id
-  `;
-  const result = await pool.query(query, [userId]);
-  if (result.rows.length === 0) {
-    throw new Error('User not found');
-  }
-  return true;
-}
-
-async function linkLeagueAccount(userId, leagueData) {
-  if (!userId || !leagueData || !leagueData.leagueId) {
-    throw new Error('User ID and leagueData.leagueId are required');
-  }
-  const { leagueId, leagueUserId, leagueName } = leagueData;
-  if (!leagueUserId || typeof leagueUserId !== 'string' || !leagueUserId.trim()) {
-    throw new Error('leagueData.leagueUserId is required and must be a non-empty string');
-  }
-  if (!leagueName || typeof leagueName !== 'string' || !leagueName.trim()) {
-    throw new Error('leagueData.leagueName is required and must be a non-empty string');
-  }
-
-  const query = `
-    INSERT INTO league_accounts
-      (user_id, league_id, league_user_id, league_name)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (user_id, league_id)
-    DO UPDATE SET
-      league_user_id = EXCLUDED.league_user_id,
-      league_name = EXCLUDED.league_name,
-      updated_at = now()
-    RETURNING id, user_id, league_id, league_user_id, league_name, created_at, updated_at
-  `;
-  const values = [userId, leagueId, leagueUserId.trim(), leagueName.trim()];
-  const result = await pool.query(query, values);
-  return result.rows[0];
-}
-
-module.exports = {
-  createUser,
-  getUserById,
-  updateUser,
-  deleteUser,
-  linkLeagueAccount
-};
+module.exports = User
