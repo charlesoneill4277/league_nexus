@@ -1,57 +1,66 @@
 const jwt = require('jsonwebtoken')
-const { promisify } = require('util')
+const crypto = require('crypto')
 const logger = require('../utils/logger')
 
-const SECRET = process.env.JWT_SECRET
-if (!SECRET) {
-  logger.error('JWT_SECRET environment variable is not defined. Exiting.')
-  process.exit(1)
+// Validate required environment variables at startup
+if (!process.env.API_KEY) {
+  logger.error('Missing required environment variable: API_KEY')
+  throw new Error('Missing required environment variable: API_KEY')
+}
+if (!process.env.JWT_SECRET) {
+  logger.error('Missing required environment variable: JWT_SECRET')
+  throw new Error('Missing required environment variable: JWT_SECRET')
 }
 
-const verifyJwt = promisify(jwt.verify)
+const authenticate = (req, res, next) => {
+  try {
+    const apiKey = req.headers['x-api-key']
+    if (apiKey) {
+      const providedKeyBuf = Buffer.from(apiKey)
+      const expectedKeyBuf = Buffer.from(process.env.API_KEY)
+      if (
+        providedKeyBuf.length === expectedKeyBuf.length &&
+        crypto.timingSafeEqual(providedKeyBuf, expectedKeyBuf)
+      ) {
+        req.user = { id: 'system', role: 'system' }
+        return next()
+      }
+      logger.warn(`Invalid API Key attempt from IP ${req.ip}`)
+      return res.status(401).json({ message: 'Invalid API Key' })
+    }
 
-function verifyToken(token) {
-  return verifyJwt(token, SECRET, { algorithms: ['HS256'] })
-}
-
-function authenticate(req, res, next) {
-  const authHeader = req.headers.authorization || req.headers['x-access-token'] || ''
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader
-  if (!token) {
-    return res.status(401).json({ message: 'Authentication token required' })
-  }
-  verifyToken(token)
-    .then(decoded => {
+    const authHeader = req.headers.authorization
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: 'Authorization header missing or malformed' })
+    }
+    const token = authHeader.split(' ')[1]
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET)
       req.user = decoded
-      next()
-    })
-    .catch(err => {
-      logger.error(`Token verification failed: ${err.message}`)
-      res.status(401).json({ message: 'Invalid or expired token' })
-    })
-}
-
-function authorize(roles) {
-  if (!roles || (Array.isArray(roles) && roles.length === 0)) {
-    throw new Error('Authorize middleware requires at least one role')
-  }
-  if (typeof roles === 'string') {
-    roles = [roles]
-  }
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ message: 'User not authenticated' })
+      return next()
+    } catch (err) {
+      logger.warn(`JWT error for request ${req.method} ${req.originalUrl}: ${err.message}`)
+      return res.status(401).json({ message: 'Invalid or expired token' })
     }
-    const userRole = req.user.role || ''
-    if (!roles.includes(userRole)) {
-      return res.status(403).json({ message: 'Access forbidden: insufficient rights' })
-    }
-    next()
+  } catch (err) {
+    logger.error(`Authentication middleware error: ${err.message}`)
+    return res.status(500).json({ message: 'Internal server error' })
   }
 }
 
-module.exports = {
-  authenticate,
-  authorize,
-  verifyToken
+const authorize = (...allowedRoles) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ message: 'Unauthorized' })
+  }
+  if (!allowedRoles.length) {
+    logger.warn(`No roles specified for authorization on ${req.originalUrl}`)
+    return res.status(403).json({ message: 'Forbidden' })
+  }
+  if (!allowedRoles.includes(req.user.role)) {
+    logger.warn(`User ${req.user.id} with role ${req.user.role} denied access to ${req.originalUrl}`)
+    return res.status(403).json({ message: 'Forbidden' })
+  }
+  next()
 }
+
+module.exports = { authenticate, authorize }
