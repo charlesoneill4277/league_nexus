@@ -1,140 +1,180 @@
-const { League, sequelize } = require('../models');
-const logger = require('../utils/logger');
+const fs = require('fs').promises
+const path = require('path')
+const ini = require('ini')
+const axios = require('axios')
+const xml2js = require('xml2js')
+const { parse: csvParse } = require('csv-parse/sync')
+const { v4: uuidv4 } = require('uuid')
+const EventEmitter = require('events')
 
-function validateId(id, name) {
-  const num = Number(id);
-  if (!Number.isInteger(num) || num <= 0) {
-    throw new Error(`Validation error: ${name} must be a positive integer`);
+class LeagueService extends EventEmitter {
+  constructor(options = {}) {
+    super()
+    this.baseDir = options.dataDir || path.resolve(process.cwd(), 'data', 'leagues')
+    this.configPath = options.configPath || path.resolve(process.cwd(), 'config.ini')
+    this.config = {}
   }
-  return num;
+
+  static async create(options = {}) {
+    const service = new LeagueService(options)
+    await service._ensureDir(service.baseDir)
+    await service._loadConfig()
+    return service
+  }
+
+  async _ensureDir(dir) {
+    try {
+      await fs.mkdir(dir, { recursive: true })
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        this.emit('warning', { message: `Failed to ensure directory ${dir}`, error: err })
+      }
+    }
+  }
+
+  async _loadConfig() {
+    try {
+      const raw = await fs.readFile(this.configPath, 'utf-8')
+      this.config = ini.parse(raw)
+    } catch (err) {
+      this.emit('warning', { message: `Failed to load config from ${this.configPath}`, error: err })
+      this.config = {}
+    }
+  }
+
+  async listLeagues() {
+    const files = await fs.readdir(this.baseDir)
+    const leagues = []
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue
+      const filePath = path.join(this.baseDir, file)
+      try {
+        const content = await fs.readFile(filePath, 'utf-8')
+        leagues.push(JSON.parse(content))
+      } catch (err) {
+        this.emit('warning', { message: `Failed to parse league file ${file}`, error: err })
+      }
+    }
+    return leagues
+  }
+
+  async getLeague(id) {
+    const file = path.join(this.baseDir, `${id}.json`)
+    try {
+      const content = await fs.readFile(file, 'utf-8')
+      return JSON.parse(content)
+    } catch {
+      return null
+    }
+  }
+
+  async createLeague(data) {
+    const id = data.id || uuidv4()
+    const now = new Date().toISOString()
+    const league = { ...data, id, createdAt: now, updatedAt: now }
+    await this._writeLeague(league)
+    return league
+  }
+
+  async updateLeague(id, updates) {
+    const league = await this.getLeague(id)
+    if (!league) return null
+    const now = new Date().toISOString()
+    const merged = { ...league, ...updates, updatedAt: now }
+    await this._writeLeague(merged)
+    return merged
+  }
+
+  async deleteLeague(id) {
+    const file = path.join(this.baseDir, `${id}.json`)
+    try {
+      await fs.unlink(file)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async ingestData(sourceName, leagueId) {
+    const sourceConfig = this.config[sourceName] || {}
+    const league = await this.getLeague(leagueId)
+    if (!league) {
+      const err = new Error(`League ${leagueId} not found`)
+      this.emit('ingestError', { source: sourceName, leagueId, error: err })
+      throw err
+    }
+    try {
+      const raw = await this._fetchRemote(sourceConfig, sourceName)
+      const parsed = await this._parseByType(raw, sourceConfig.type)
+      const updated = { ...league, ...parsed, updatedAt: new Date().toISOString() }
+      await this._writeLeague(updated)
+      this.emit('ingestCompleted', { source: sourceName, leagueId, data: parsed })
+      return updated
+    } catch (error) {
+      this.emit('ingestError', { source: sourceName, leagueId, error })
+      throw error
+    }
+  }
+
+  async _fetchRemote(cfg, sourceName) {
+    const method = (cfg.method || 'get').toLowerCase()
+    let headers, params, data
+    if (cfg.headers) {
+      try {
+        headers = JSON.parse(cfg.headers)
+      } catch (err) {
+        throw new Error(`Invalid JSON in headers for source ${sourceName}: ${err.message}`)
+      }
+    }
+    if (cfg.params) {
+      try {
+        params = JSON.parse(cfg.params)
+      } catch (err) {
+        throw new Error(`Invalid JSON in params for source ${sourceName}: ${err.message}`)
+      }
+    }
+    if (cfg.body) {
+      try {
+        data = JSON.parse(cfg.body)
+      } catch (err) {
+        throw new Error(`Invalid JSON in body for source ${sourceName}: ${err.message}`)
+      }
+    }
+    const options = {
+      url: cfg.url,
+      method,
+      headers,
+      params,
+      data,
+      responseType: 'text'
+    }
+    const res = await axios(options)
+    return res.data
+  }
+
+  async _parseByType(data, type = 'json') {
+    switch ((type || '').toLowerCase()) {
+      case 'xml': {
+        const parser = new xml2js.Parser({ explicitArray: false })
+        return parser.parseStringPromise(data)
+      }
+      case 'csv': {
+        return csvParse(data, { columns: true, skip_empty_lines: true })
+      }
+      default:
+        try {
+          return JSON.parse(data)
+        } catch {
+          return data
+        }
+    }
+  }
+
+  async _writeLeague(league) {
+    const file = path.join(this.baseDir, `${league.id}.json`)
+    const content = JSON.stringify(league, null, 2)
+    await fs.writeFile(file, content, 'utf-8')
+  }
 }
 
-function validateDate(value, name) {
-  if (value === undefined || value === null) return null;
-  const d = new Date(value);
-  if (isNaN(d.getTime())) {
-    throw new Error(`Validation error: ${name} must be a valid date`);
-  }
-  return d;
-}
-
-async function fetchLeagueOrThrow(leagueId, transaction) {
-  const options = transaction ? { transaction } : {};
-  const league = await League.findByPk(leagueId, options);
-  if (!league) {
-    const msg = `League not found with id=${leagueId}`;
-    logger.warn(msg);
-    throw new Error(msg);
-  }
-  return league;
-}
-
-async function createLeague(leagueData) {
-  if (!leagueData.name) {
-    throw new Error('Validation error: name is required');
-  }
-  if (leagueData.ownerId === undefined) {
-    throw new Error('Validation error: ownerId is required');
-  }
-  const name = leagueData.name;
-  const ownerId = validateId(leagueData.ownerId, 'ownerId');
-  const description = leagueData.description || null;
-  const startDate = validateDate(leagueData.startDate, 'startDate');
-  const endDate = validateDate(leagueData.endDate, 'endDate');
-
-  const transaction = await sequelize.transaction();
-  try {
-    const league = await League.create(
-      { name, description, startDate, endDate, ownerId },
-      { transaction }
-    );
-    await transaction.commit();
-    logger.info(`League created with id=${league.id}`);
-    return league;
-  } catch (err) {
-    await transaction.rollback();
-    logger.error('Error creating league', err);
-    throw err;
-  }
-}
-
-async function getLeagueById(leagueId) {
-  const id = validateId(leagueId, 'leagueId');
-  let league;
-  try {
-    league = await League.findByPk(id);
-  } catch (err) {
-    logger.error(`Error fetching league id=${id}`, err);
-    throw err;
-  }
-  if (!league) {
-    const msg = `League not found with id=${id}`;
-    logger.warn(msg);
-    throw new Error(msg);
-  }
-  return league;
-}
-
-async function updateLeague(leagueId, updateData) {
-  const id = validateId(leagueId, 'leagueId');
-  const allowed = ['name', 'description', 'startDate', 'endDate'];
-  const payload = {};
-  if (updateData.name !== undefined) payload.name = updateData.name;
-  if (updateData.description !== undefined) payload.description = updateData.description;
-  if (updateData.startDate !== undefined) payload.startDate = validateDate(updateData.startDate, 'startDate');
-  if (updateData.endDate !== undefined) payload.endDate = validateDate(updateData.endDate, 'endDate');
-  if (Object.keys(payload).length === 0) {
-    throw new Error('No valid fields to update');
-  }
-
-  const transaction = await sequelize.transaction();
-  try {
-    const league = await fetchLeagueOrThrow(id, transaction);
-    await league.update(payload, { transaction });
-    await transaction.commit();
-    logger.info(`League updated id=${id}`);
-    return league;
-  } catch (err) {
-    await transaction.rollback();
-    logger.error(`Error updating league id=${id}`, err);
-    throw err;
-  }
-}
-
-async function listLeagues(userId) {
-  const ownerId = validateId(userId, 'userId');
-  try {
-    const leagues = await League.findAll({
-      where: { ownerId },
-      order: [['createdAt', 'DESC']]
-    });
-    return leagues;
-  } catch (err) {
-    logger.error(`Error listing leagues for userId=${ownerId}`, err);
-    throw err;
-  }
-}
-
-async function deleteLeague(leagueId) {
-  const id = validateId(leagueId, 'leagueId');
-  const transaction = await sequelize.transaction();
-  try {
-    await fetchLeagueOrThrow(id, transaction);
-    await League.destroy({ where: { id }, transaction });
-    await transaction.commit();
-    logger.info(`League deleted id=${id}`);
-    return true;
-  } catch (err) {
-    await transaction.rollback();
-    logger.error(`Error deleting league id=${id}`, err);
-    throw err;
-  }
-}
-
-module.exports = {
-  createLeague,
-  getLeagueById,
-  updateLeague,
-  listLeagues,
-  deleteLeague
-};
+module.exports = LeagueService
